@@ -5,20 +5,26 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ChatOpenAI } from '@langchain/openai';
-import { HumanMessage, SystemMessage } from '@langchain/core/messages';
+import { HumanMessage, SystemMessage, type BaseMessage } from '@langchain/core/messages';
 import { HybridRetrievalService } from './hybrid-retrieval.service';
 import { ChunkHit } from '../pipeline/types/pipeline.types';
 import { ChatSessionService } from './chat-session.service';
+import { ChatShortMemoryService } from './chat-short-memory.service';
+import { ChatLongMemoryService } from './chat-long-memory.service';
+import { ChatQueryRewriteService, type ChatIntent } from './chat-query-rewrite.service';
+import { retrieveUntilRelevant } from './agentic-retrieve';
+import { WebSearchService, type WebSearchResult } from './web-search.service';
+import { dbRowsToMessages } from './chat-memory.util';
 import type { AuthUser } from '../auth/auth-user.interface';
 import type { ChatSource } from './chat.types';
 
 export type { ChatSource } from './chat.types';
 
-const EXCERPT_LEN = 200;
-const CITATION_RE = /\[(\d+)\]/g;
+const EXCERPT_LEN = 200; // 引用摘录截断长度（字符）
+const CITATION_RE = /\[(\d+)\]/g; // 回答里的 [1]、[2] 引用编号
 
 /**
- * RAG 对话：kh_chunk 混合检索（关键词 + 向量 + RRF + rerank）→ LLM 作答。
+ * 非流式 Agentic RAG：意图路由 → 检索+切题评估+不足则改写再查 → 按需联网 → 作答。
  */
 @Injectable()
 export class AiChatService {
@@ -29,6 +35,10 @@ export class AiChatService {
     config: ConfigService,
     private readonly retrieval: HybridRetrievalService,
     private readonly sessions: ChatSessionService,
+    private readonly shortMemory: ChatShortMemoryService,
+    private readonly longMemory: ChatLongMemoryService,
+    private readonly queryRewrite: ChatQueryRewriteService,
+    private readonly webSearch: WebSearchService,
   ) {
     const apiKey =
       config.get<string>('OPENAI_API_KEY') ||
@@ -74,8 +84,36 @@ export class AiChatService {
       };
     }
 
-    const hits = await this.retrieval.retrieve(trimmed, topK, user);
-    if (!hits.length) {
+    const history = user
+      ? await this.loadWorkingHistory(user.userId, sessionId)
+      : [];
+    const plan = await this.queryRewrite.classify(trimmed, history);
+    const memHitsP = user
+      ? this.longMemory.search(user.userId, sessionId, plan.query)
+      : Promise.resolve({ user: [] as string[], session: [] as string[] });
+    // 非流式没有 Agent 工具环，但检索仍走同一套：评估切题，不足则改写再查。
+    let hits = [] as ChunkHit[];
+    let kbInsufficient = false;
+    let searchQuery = plan.query || trimmed;
+    if (plan.allowRetrieve) {
+      const retrieved = await retrieveUntilRelevant({
+        question: trimmed,
+        query: plan.query,
+        topK,
+        user,
+        retrieval: this.retrieval,
+        rewrite: this.queryRewrite,
+      });
+      hits = retrieved.hits;
+      kbInsufficient = !retrieved.eval.ok;
+      searchQuery = retrieved.usedQuery || searchQuery;
+    }
+    const web =
+      plan.allowWeb && (!plan.allowRetrieve || kbInsufficient)
+        ? await this.webSearch.search(searchQuery)
+        : undefined;
+    const memHits = await memHitsP;
+    if (plan.intent === 'kb' && kbInsufficient) {
       const empty = {
         answer: '知识库里没有相关内容。',
         sources: [] as ChatSource[],
@@ -89,6 +127,21 @@ export class AiChatService {
             empty.sources,
           )
         : null;
+      if (user && session) {
+        await this.shortMemory.appendTurn(
+          user.userId,
+          session.id,
+          history,
+          trimmed,
+          empty.answer,
+        );
+        this.longMemory.rememberTurn(
+          user.userId,
+          session.id,
+          trimmed,
+          empty.answer,
+        );
+      }
       return { sessionId: session?.id ?? sessionId ?? null, ...empty };
     }
 
@@ -98,18 +151,17 @@ export class AiChatService {
       );
     }
 
-    const context = this.buildContext(hits);
+    const memoryMsg = this.longMemory.buildSystemMessage(memHits);
+    const parts: string[] = [];
+    if (hits.length) parts.push(`知识库资料：\n${this.buildContext(hits)}`);
+    if (web) parts.push(`联网结果：\n${this.buildWebContext(web)}`);
+    parts.push(`用户问题：${trimmed}`);
+    const userTurn = parts.join('\n\n');
     const response = await this.llm.invoke([
-      new SystemMessage(
-        '你是企业知识库助手。只根据「检索到的资料」回答用户问题。' +
-          '若资料不足以回答，明确说不知道，不要编造。' +
-          '凡是依据某条资料作出的陈述，必须在句末标注对应编号，如 [1]、[2]。' +
-          '编号必须与资料列表一致，不要标注未使用的编号，不要编造文档标题或链接。' +
-          '回答简洁，必要时列出条目。',
-      ),
-      new HumanMessage(
-        `检索到的资料：\n${context}\n\n用户问题：${trimmed}`,
-      ),
+      new SystemMessage(this.buildSystemPrompt(plan.intent, Boolean(hits.length), web)),
+      ...(memoryMsg ? [memoryMsg] : []),
+      ...history,
+      new HumanMessage(userTurn),
     ]);
 
     const answer =
@@ -132,7 +184,42 @@ export class AiChatService {
         )
       : null;
 
+    if (user && session) {
+      await this.shortMemory.appendTurn(
+        user.userId,
+        session.id,
+        history,
+        trimmed,
+        answer,
+      );
+      void this.longMemory.rememberTurn(
+        user.userId,
+        session.id,
+        trimmed,
+        answer,
+      );
+    }
+
     return { sessionId: session?.id ?? sessionId ?? null, answer, sources };
+  }
+
+  private async loadWorkingHistory(
+    userId: string,
+    sessionId: string | undefined,
+  ): Promise<BaseMessage[]> {
+    if (!sessionId) return [];
+    const cached = await this.shortMemory.tryLoad(userId, sessionId);
+    if (cached) return cached;
+    const rows = await this.sessions.listRecentMessages(
+      userId,
+      sessionId,
+      this.shortMemory.windowSize,
+    );
+    const history = dbRowsToMessages(rows);
+    if (history.length) {
+      await this.shortMemory.save(userId, sessionId, history);
+    }
+    return history;
   }
 
   /** 从回答中抽出 [n]，只返回实际引用的资料；未标注时回退为全部召回（摘录）。 */
@@ -178,4 +265,38 @@ export class AiChatService {
       })
       .join('\n\n');
   }
+
+  private buildWebContext(web: WebSearchResult): string {
+    if (web.error) return web.error;
+    if (!web.items.length) return '无结果。';
+    return web.items
+      .map((hit, i) => `${i + 1}. ${hit.title}\n${hit.url}\n${hit.snippet}`)
+      .join('\n\n');
+  }
+
+  private buildSystemPrompt(
+    intent: ChatIntent,
+    hasKb: boolean,
+    web?: WebSearchResult,
+  ): string {
+    let prompt =
+      '你是企业知识库助手。结合对话历史和记忆里的用户背景回答。' +
+      '制度/流程以本轮知识库资料为准，不要用记忆替代文档。';
+    if (hasKb) {
+      prompt +=
+        '凡是依据某条资料作出的陈述，必须在句末标注对应编号，如 [1]、[2]。' +
+        '编号必须与资料列表一致，不要标注未使用的编号，不要编造文档标题或链接。';
+    } else if (intent === 'kb' || intent === 'kb_then_web') {
+      prompt += '知识库没有切题资料，不要编造内部制度。';
+    }
+    if (web?.items.length) {
+      prompt += '联网结果只作公开信息补充，用标题+链接说明，不要写成公司内部规定。';
+    }
+    if (intent === 'chitchat' || intent === 'profile') {
+      prompt += '可回应寒暄或个人偏好，不要编造制度。';
+    }
+    prompt += '若资料不足以回答，明确说不知道。回答简洁，必要时列出条目。';
+    return prompt;
+  }
 }
+
