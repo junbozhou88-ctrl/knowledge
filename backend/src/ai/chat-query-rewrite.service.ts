@@ -5,6 +5,7 @@ import { HumanMessage, SystemMessage, type BaseMessage } from '@langchain/core/m
 import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
 import { z } from 'zod';
 import { compactRewriteContext } from './chat-memory.util';
+import { withObservation } from '../observability/langfuse';
 import type { ChunkHit } from '../pipeline/types/pipeline.types';
 
 /**
@@ -40,10 +41,14 @@ export type ChatIntent = (typeof CHAT_INTENTS)[number];
 export type ChatRoutePlan = {
   intent: ChatIntent;
   label: string;
-  /** 消解指代后的独立短查询，给 RAG / 联网用 */
+  /** 消解指代后的独立短查询，给知识库 / 联网用（可以是一句） */
   query: string;
+  /** 图谱用的短实体名，如 发票 / 报销 / 差旅；整句不能拿去对图 */
+  graphQueries: string[];
   /** kb / kb_then_web 才挂 retrieve_knowledge */
   allowRetrieve: boolean;
+  /** 与 allowRetrieve 相同：要查知识库的轮次才查图谱 */
+  allowGraph: boolean;
   /** web / kb_then_web 才挂 web_search */
   allowWeb: boolean;
 };
@@ -84,6 +89,12 @@ const routeSchema = z.object({
   standalone_query: z
     .string()
     .describe('可独立检索的一句中文短查询，消解指代。闲聊/偏好可原样'),
+  graph_queries: z
+    .array(z.string())
+    .optional()
+    .describe(
+      '图谱短实体名：2～6 个、每个 2～8 字。闲聊/偏好/纯联网必须空数组',
+    ),
 });
 
 /** 检索切题评估的结构化输出 */
@@ -107,7 +118,7 @@ const GRADE_PROMPT =
   '\n' +
   '- 切题：同一主题、同一制度/岗位/流程，能支撑作答（不必覆盖每个细节）\n' +
   '- 不切题：只是词沾边（如问加班餐补却命中差旅报销）、或完全另一件事\n' +
-  '- 只根据给定标题和摘录判断，不要假设库里还有别的文档\n' +
+  '- 只根据给定标题和正文判断，不要假设库里还有别的文档\n' +
   '- 输出不要解释字段以外的内容';
 
 /** 不足时换一种问法再查知识库 */
@@ -120,9 +131,9 @@ const RETRY_REWRITE_PROMPT =
   '- 不要编造条款号、专有名词\n' +
   '- 一句中文，尽量不超过 40 字';
 
-/** 本轮意图 + 建议检索词（进 Agent 前只跑一次） */
+/** 本轮意图 + 文档检索句 + 图谱短实体名（进 Agent 前只跑一次） */
 const ROUTE_PROMPT =
-  '你是企业知识库的意图与检索改写器。根据对话判断本轮意图，并给出一条可检索短查询。\n' +
+  '你是企业知识库的意图与检索改写器。根据对话判断本轮意图，给出文档检索句，以及图谱要用的短实体名。\n' +
   '\n' +
   '## intent\n' +
   '- chitchat：问好、致谢、与库无关的闲聊\n' +
@@ -137,10 +148,17 @@ const ROUTE_PROMPT =
   '- 记忆里的用户部门不能改变本题意图\n' +
   '\n' +
   '## standalone_query\n' +
-  '- 消解「这个 / 谁负责 / 怎么办」，补全省略主题，一句中文，尽量不超过 40 字\n' +
+  '- 给知识库全文检索用，可以是一句；消解「这个 / 谁负责 / 怎么办」，尽量不超过 40 字\n' +
   '- 不要编造上文没有的专有名词、条款号\n' +
   '- 不要复述助手已给出的制度条文\n' +
   '- 闲聊/偏好：用原问题即可\n' +
+  '\n' +
+  '## graph_queries\n' +
+  '- 只在 kb / kb_then_web 填写，其他意图必须空数组\n' +
+  '- 每个词 2～4 个字的实体短名（人/岗/制度对象），不要整句、不要问号\n' +
+  '- 必须拆开：发票如何报销 → 发票、报销；发票报销流程和要求 → 发票、报销\n' +
+  '- 可补 1 个同域短名（报销可带差旅）\n' +
+  '- 禁止：流程、要求、办法、如何、怎么、什么、是什么\n' +
   '- 输出不要解释';
 
 /**
@@ -202,33 +220,40 @@ export class ChatQueryRewriteService {
     question: string,
     history: BaseMessage[],
   ): Promise<ChatRoutePlan> {
-    const fallback = this.toPlan('kb', question);
-    if (!this.router) return fallback;
+    return withObservation('intent-classify', async (update) => {
+      const fallback = this.toPlan('kb', question);
+      if (!this.router) {
+        update({ input: question, output: fallback });
+        return fallback;
+      }
 
-    const context = compactRewriteContext(history);
-    try {
-      const result = await invokeIsolated(() =>
-        this.router!.invoke([
-          new SystemMessage(ROUTE_PROMPT),
-          new HumanMessage(
-            context
-              ? `对话：\n${context}\n\n当前问题：${question}`
-              : `当前问题：${question}`,
-          ),
-        ]),
-      );
-      const query = result.standalone_query.trim() || question;
-      const plan = this.toPlan(result.intent, query);
-      this.logger.log(
-        `意图：${plan.intent} query=${plan.query.slice(0, 80)}`,
-      );
-      return plan;
-    } catch (error) {
-      this.logger.warn(
-        `意图识别失败，按知识库处理：${error instanceof Error ? error.message : error}`,
-      );
-      return fallback;
-    }
+      const context = compactRewriteContext(history);
+      try {
+        const result = await invokeIsolated(() =>
+          this.router!.invoke([
+            new SystemMessage(ROUTE_PROMPT),
+            new HumanMessage(
+              context
+                ? `对话：\n${context}\n\n当前问题：${question}`
+                : `当前问题：${question}`,
+            ),
+          ]),
+        );
+        const query = result.standalone_query.trim() || question;
+        const plan = this.toPlan(result.intent, query, result.graph_queries);
+        this.logger.log(
+          `意图：${plan.intent} query=${plan.query.slice(0, 80)} graph=${plan.graphQueries.join('/') || '-'}`,
+        );
+        update({ input: question, output: plan });
+        return plan;
+      } catch (error) {
+        this.logger.warn(
+          `意图识别失败，按知识库处理：${error instanceof Error ? error.message : error}`,
+        );
+        update({ input: question, output: fallback, metadata: { error: true } });
+        return fallback;
+      }
+    });
   }
 
   /** 给非流式 /ai/chat 用：只关心要不要查知识库 */
@@ -242,31 +267,41 @@ export class ChatQueryRewriteService {
 
   /** 有命中再判切题；空结果不调模型。评估失败时有召回则放行，避免误杀。 */
   async gradeHits(question: string, hits: ChunkHit[]): Promise<HitGrade> {
-    if (!hits.length) {
-      return { ok: false, reason: 'empty', text: '未检索到资料' };
-    }
-    if (!this.grader) {
-      return { ok: true, reason: 'relevant', text: '有召回（未配置评估模型）' };
-    }
-    try {
-      const result = await invokeIsolated(() =>
-        this.grader!.invoke([
-          new SystemMessage(GRADE_PROMPT),
-          new HumanMessage(
-            `用户问题：${question}\n\n命中资料：\n${summarizeHits(hits)}`,
-          ),
-        ]),
-      );
-      const ok = result.relevant;
-      const text = result.reason.trim() || (ok ? '资料切题' : '资料不切题');
-      this.logger.log(`检索评估：${ok ? '切题' : '不切题'} ${text.slice(0, 80)}`);
-      return { ok, reason: ok ? 'relevant' : 'irrelevant', text };
-    } catch (error) {
-      this.logger.warn(
-        `检索评估失败，按有召回放行：${error instanceof Error ? error.message : error}`,
-      );
-      return { ok: true, reason: 'relevant', text: '评估失败，按有召回处理' };
-    }
+    return withObservation('retrieve-grade', async (update) => {
+      if (!hits.length) {
+        const empty: HitGrade = { ok: false, reason: 'empty', text: '未检索到资料' };
+        update({ input: { question, n: 0 }, output: empty });
+        return empty;
+      }
+      if (!this.grader) {
+        const pass: HitGrade = { ok: true, reason: 'relevant', text: '有召回（未配置评估模型）' };
+        update({ input: { question, n: hits.length }, output: pass });
+        return pass;
+      }
+      try {
+        const result = await invokeIsolated(() =>
+          this.grader!.invoke([
+            new SystemMessage(GRADE_PROMPT),
+            new HumanMessage(
+              `用户问题：${question}\n\n命中资料：\n${summarizeHits(hits)}`,
+            ),
+          ]),
+        );
+        const ok = result.relevant;
+        const text = result.reason.trim() || (ok ? '资料切题' : '资料不切题');
+        this.logger.log(`检索评估：${ok ? '切题' : '不切题'} ${text.slice(0, 80)}`);
+        const grade: HitGrade = { ok, reason: ok ? 'relevant' : 'irrelevant', text };
+        update({ input: { question, n: hits.length }, output: grade });
+        return grade;
+      } catch (error) {
+        this.logger.warn(
+          `检索评估失败，按有召回放行：${error instanceof Error ? error.message : error}`,
+        );
+        const fallback: HitGrade = { ok: true, reason: 'relevant', text: '评估失败，按有召回处理' };
+        update({ input: { question, n: hits.length }, output: fallback });
+        return fallback;
+      }
+    });
   }
 
   /**
@@ -279,43 +314,59 @@ export class ChatQueryRewriteService {
     grade: HitGrade,
     hits: ChunkHit[],
   ): Promise<string> {
-    const fallback = distinctQuery(question, previousQuery);
-    if (!this.retryWriter) return fallback;
-
-    try {
-      const hitBlock = hits.length
-        ? `\n上次命中（不切题）：\n${summarizeHits(hits, 3)}`
-        : '\n上次无命中。';
-      const result = await invokeIsolated(() =>
-        this.retryWriter!.invoke([
-          new SystemMessage(RETRY_REWRITE_PROMPT),
-          new HumanMessage(
-            `用户问题：${question}\n上次检索词：${previousQuery}\n不足原因：${grade.text}${hitBlock}`,
-          ),
-        ]),
-      );
-      const query = distinctQuery(result.query.trim(), previousQuery);
-      if (query) {
-        this.logger.log(`检索改写：${previousQuery.slice(0, 40)} → ${query.slice(0, 40)}`);
-        return query;
+    return withObservation('rewrite-query', async (update) => {
+      const fallback = distinctQuery(question, previousQuery);
+      if (!this.retryWriter) {
+        update({ input: previousQuery, output: fallback });
+        return fallback;
       }
-      return fallback;
-    } catch (error) {
-      this.logger.warn(
-        `检索改写失败，回退原问题：${error instanceof Error ? error.message : error}`,
-      );
-      return fallback;
-    }
+
+      try {
+        const hitBlock = hits.length
+          ? `\n上次命中（不切题）：\n${summarizeHits(hits, 3)}`
+          : '\n上次无命中。';
+        const result = await invokeIsolated(() =>
+          this.retryWriter!.invoke([
+            new SystemMessage(RETRY_REWRITE_PROMPT),
+            new HumanMessage(
+              `用户问题：${question}\n上次检索词：${previousQuery}\n不足原因：${grade.text}${hitBlock}`,
+            ),
+          ]),
+        );
+        const query = distinctQuery(result.query.trim(), previousQuery);
+        if (query) {
+          this.logger.log(`检索改写：${previousQuery.slice(0, 40)} → ${query.slice(0, 40)}`);
+          update({ input: previousQuery, output: query });
+          return query;
+        }
+        update({ input: previousQuery, output: fallback });
+        return fallback;
+      } catch (error) {
+        this.logger.warn(
+          `检索改写失败，回退原问题：${error instanceof Error ? error.message : error}`,
+        );
+        update({ input: previousQuery, output: fallback });
+        return fallback;
+      }
+    });
   }
 
   /** 意图 → 工具开关。识别失败时 classify 会落到 kb，避免内部问题漏检。 */
-  private toPlan(intent: ChatIntent, query: string): ChatRoutePlan {
+  private toPlan(
+    intent: ChatIntent,
+    query: string,
+    graphQueries?: string[],
+  ): ChatRoutePlan {
     const kb = intent === 'kb' || intent === 'kb_then_web';
     return {
       intent,
       label: INTENT_LABEL[intent],
       query,
+      graphQueries: kb
+        ? (graphQueries ?? []).map((q) => q.trim()).filter(Boolean)
+        : [],
       allowRetrieve: kb,
+      allowGraph: kb,
       allowWeb: intent === 'web' || intent === 'kb_then_web',
     };
   }
@@ -326,9 +377,8 @@ function summarizeHits(hits: ChunkHit[], limit = 5): string {
     .slice(0, limit)
     .map((hit, i) => {
       const heading = hit.heading ? ` / ${hit.heading}` : '';
-      const snippet = hit.content.replace(/\s+/g, ' ').trim().slice(0, 180);
       const score = Number.isFinite(hit.score) ? hit.score.toFixed(2) : '-';
-      return `${i + 1}. ${hit.documentTitle}${heading}（分=${score}）\n${snippet}`;
+      return `${i + 1}. ${hit.documentTitle}${heading}（分=${score}）\n${hit.content.trim()}`;
     })
     .join('\n');
 }
